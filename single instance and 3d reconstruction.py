@@ -16,8 +16,8 @@ from collections import deque
 from sleap_io.model.skeleton import Skeleton, Node, Edge
 
 # ========= 用户需修改的路径 =========
-MODEL_A_DIR = r"D:\Meiqi\Extra files for sleap test\2025-11-10\models\None_251111_103704.single_instance.n=50"  # 摄像头0的模型目录（含 best.ckpt / training_config.yaml）
-MODEL_B_DIR = r"D:\Meiqi\Extra files for sleap test\2025-11-10\models\None_251111_123231.single_instance.n=50"  # 摄像头1的模型目录
+MODEL_A_DIR = r"C:\Users\ZH001\2025-11-10\models\None_251111_103704.single_instance.n=50"  # 摄像头0的模型目录（含 best.ckpt / training_config.yaml）
+MODEL_B_DIR = r"C:\Users\ZH001\2025-11-10\models\None_251111_123231.single_instance.n=50"  # 摄像头1的模型目录
 #CALIB_NPZ   = r"D:\calib\stereo_calib_cam0_cam1.npz"  # 标定结果
 USE_CUDA    = True  # 没GPU改 False
 NODE_NAMES = []
@@ -304,7 +304,7 @@ def camera_worker(cam_index:int, MODEL_DIR:str, out_queue:mp.Queue, stop_event:m
     predictor = SingleInstancePredictor.from_trained_models(
         confmap_ckpt_path=MODEL_DIR,  # 传目录，内部会找 best/latest.ckpt
         preprocess_config=pre_cfg,  # 刚提取并补齐的 OmegaConf
-        device="cuda"  # 无GPU用 "cpu"
+        device="cpu"  # 无GPU用 "cpu"
     )
 
     # 2) 打开摄像头
@@ -561,36 +561,14 @@ class MovingAverage:
 
 # ========= 进程：三角化融合 =========
 def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event, min_score:float=0.3):
-    UDP_IP = "127.0.0.1"
+    UDP_IP = "10.87.209.221"
     UDP_PORT = 5005
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    start_time = time.time()
     # 1) 读取标定
     camera_params = [
         # 示例占位（务必用实际标定结果替换）
         {
-
-        #     "K": np.array([[1.18393561e+03, 0.00000000e+00, 9.59500000e+02],
-        #                 [0.00000000e+00, 1.18636266e+03, 5.39500000e+02],
-        #                  [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]]),
-        #     "dist": np.array([[ 0.15464462, -0.27189405,  0, 0, 0]]),
-        #     # 示例外参：第二台相机绕y轴平移 200mm
-        #     "R": np.array([[ 0.99951816, 0.00846809, 0.02986208],
-        #                  [-0.01769308, 0.9459, 0.32397554],
-        #                  [-0.02550309,  -0.32434779, 0.94559405  ]] ),
-        #     #"t": np.array([80.146, 430.1, 839.5])  # 单位：米（或与K相同尺度）
-        #     "t": np.array([0.14335747, -0.09043696, 0.94931117])  # 单位：米（或与K相同尺度）
-        # },
-        # {
-        #     "K": np.array([[1.13204588e+03, 0.00000000e+00, 9.59500000e+02],
-        #                      [0.00000000e+00, 1.12927387e+03, 5.39500000e+02],
-        #                      [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]]),
-        #     "dist": np.array([[  0.15777187, -0.29436901, 0,  0, 0]]),
-        #     "R": np.array([[ 0.9213385,  -0.33172853, 0.20271049],
-        #                      [ 0.21218428, 0.86600362, 0.45278644],
-        #                      [-0.3257502,  -0.3741576, 0.86827006]]),
-        #     #"t": np.array([9.5, -304.788, 937.249])
-        #     "t": np.array([0.05804301, -0.0985619, 0.9754403])
-
             "K": np.array([[1.18393561e+03, 0.00000000e+00, 9.59500000e+02],
                            [0.00000000e+00, 1.18636266e+03, 5.39500000e+02],
                            [0.00000000e+00, 0.00000000e+00, 1.00000000e+00]]),
@@ -656,7 +634,9 @@ def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event,
 
             # 逐节点三角化
             pts3d = {}
+
             for i in range(max(len(xy_a), len(xy_b))):
+
                 pa = xy_a[i] if i < len(xy_a) else None
                 pb = xy_b[i] if i < len(xy_b) else None
                 sa = sc_a[i] if i < len(sc_a) else 0.0
@@ -688,20 +668,50 @@ def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event,
                 # 构造齐次像素（归一化平面）
                 # pts1 = np.array([[ua], [va]], dtype=np.float32)
                 # pts2 = np.array([[ub], [vb]], dtype=np.float32)
-
+                print((ua,va),(ub,vb))
                 # 三角化（归一化平面用 P1,P2）
                 X = triangulate_multiview([(ua,va),(ub,vb)],[proj_mats[0],proj_mats[1]])  # (4,N)
 
 
-                pts3d[NODE_NAMES[i]] = (float(X[0]), float(X[1]), float(X[2]))
-                print(NODE_NAMES[i],": ",float(X[0]), ",", float(X[1]), ",", float(X[2]))
+                pts3d[NODE_NAMES[i]] = [float(X[0])*0.05, float(X[1])*0.05, float(X[2])*0.05]
+                #print(NODE_NAMES[i],": ",float(X[0]), ",", float(X[1]), ",", float(X[2]))
             print("------------------------------------------------------")
-            print(pts3d)
+            # pts3d["head"] = [0,0.5,0.2+ 0.1*(time.time() - start_time)]
+            # pts3d["chest_left"] = [-0.2,0,0.5]
+            # pts3d["chest"] = [0,0,0.5]
+            # pts3d["chest_right"] = [0.2,0,0.5]
+            # pts3d["tail"] = [0,-0.5,0.2]
+            print(time.time(),": ",pts3d)
             packet = {
-                "timestamp": time.time(),
+                "timestamp": time.time() - start_time,
+                "name": "Cockroach-96",
                 "points": pts3d
             }
             sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
+            # pts3d["head"] = [9.7, 0.3, 0.2]
+            # pts3d["chest_left"] = [9.8, 0, 0.5]
+            # pts3d["chest"] = [10, 0, 0.5]
+            # pts3d["chest_right"] = [10.2, 0, 0.5]
+            # pts3d["tail"] = [10, -0.5, 0.2]
+            # print(time.time(),": ",pts3d)
+            # packet = {
+            #     "timestamp": time.time() - start_time,
+            #     "name": "Cockroach-v8",
+            #     "points": pts3d
+            # }
+            # sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
+            # pts3d["head"] = [5, 5.4, 0.7]
+            # pts3d["chest_left"] = [4.8, 5, 0.5]
+            # pts3d["chest"] = [5, 5, 0.5]
+            # pts3d["chest_right"] = [5.2, 5, 0.5]
+            # pts3d["tail"] = [5, 4.5, 0.2]
+            # print(time.time(),": ",pts3d)
+            # packet = {
+            #     "timestamp": time.time() - start_time,
+            #     "name": "Cockroach-12",
+            #     "points": pts3d
+            # }
+            # sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
             # 这里你可以：
             # - 打印
             # - 存入共享内存
@@ -730,7 +740,7 @@ def main():
     stop_event = mp.Event()
 
     # 子进程
-    proc_cam0 = mp.Process(target=camera_worker, args=(0, MODEL_A_DIR, q_a, stop_event))
+    proc_cam0 = mp.Process(target=camera_worker, args=(2, MODEL_A_DIR, q_a, stop_event))
     proc_cam1 = mp.Process(target=camera_worker, args=(1, MODEL_B_DIR, q_b, stop_event))
     proc_fuse = mp.Process(target=fusion_worker, args=(q_a, q_b, stop_event, 0.35))
 
