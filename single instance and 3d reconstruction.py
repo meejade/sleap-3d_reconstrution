@@ -244,6 +244,220 @@ def bone_length_project(i, z_xy, est_xy, EDGE_INDS, REF_LEN, L_TOL):
             changed = True
     return (float(z[0]), float(z[1])), changed
 
+# >>> NEW: 一些小工具函数（单位向量等）
+def _unit(v):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return v * 0.0
+    return v / n
+
+# >>> NEW: 专门针对你这个 chest + chest_left/right + head + tail 结构的几何兜底
+def sanitize_for_bug_backpack(est_xy, NODE_NAMES, prev_state=None):
+    """
+    est_xy: (N, 2) 当前 KF + 骨长纠偏 之后的估计
+    NODE_NAMES: 节点名列表（包含 head, tail, chest, chest_left, chest_right）
+    prev_state: 上一帧的形态状态（里面存轴向和参考长度等），第一次可以传 None
+
+    返回: (xy_sanitized, new_state)
+    """
+    xy = est_xy.copy()
+    name2idx = {n: i for i, n in enumerate(NODE_NAMES)}
+
+    i_head  = name2idx.get("head")
+    i_tail  = name2idx.get("tail")
+    i_chest = name2idx.get("chest")
+    i_l     = name2idx.get("chest_left")
+    i_r     = name2idx.get("chest_right")
+
+    def ok(idx):
+        return (
+            idx is not None
+            and 0 <= idx < xy.shape[0]
+            and not np.any(np.isnan(xy[idx]))
+        )
+
+    # --- 从上一帧拿轴向 / 参考长度（如果有） ---
+    axes       = None if prev_state is None else prev_state.get("axes", None)
+    body_ref   = None if prev_state is None else prev_state.get("body_len_ref", None)
+    h_ref      = None if prev_state is None else prev_state.get("h_ref", None)
+    wL_ref     = None if prev_state is None else prev_state.get("wL_ref", None)
+    wR_ref     = None if prev_state is None else prev_state.get("wR_ref", None)
+
+    # ========== 1) 估计身体前向 f 和左右轴 right ==========
+    if ok(i_head) and ok(i_tail):
+        head = xy[i_head]
+        tail = xy[i_tail]
+        body_vec = head - tail
+        L = float(np.linalg.norm(body_vec))
+
+        if L > 1e-6:
+            f = _unit(body_vec)  # forward：tail -> head
+        elif axes is not None:
+            # 长度太短，用上一帧
+            f = axes["f"]
+        else:
+            f = np.array([1.0, 0.0], dtype=float)
+
+        # 图像平面里，取一个与 f 垂直的向量作为“右轴”
+        right = _unit(np.array([f[1], -f[0]], dtype=float))
+        axes = {"f": f, "right": right}
+
+        # 维护一个身体长度参考（头尾距离）
+        if body_ref is None:
+            body_ref = L if L > 1e-3 else 1.0
+        else:
+            alpha = 0.9  # 指数平滑
+            body_ref = alpha * body_ref + (1 - alpha) * L
+    elif axes is None:
+        # 连 head/tail 都没有，就没啥好修的
+        new_state = {"axes": None, "body_len_ref": body_ref,
+                     "h_ref": h_ref, "wL_ref": wL_ref, "wR_ref": wR_ref}
+        return xy, new_state
+    else:
+        f = axes["f"]
+        right = axes["right"]
+
+    # ========== 2) 头尾间距 + 方向连续性（防黏在一起、防反标） ==========
+    if ok(i_head) and ok(i_tail):
+        head = xy[i_head]
+        tail = xy[i_tail]
+        v = head - tail
+        L = float(np.linalg.norm(v))
+
+        if body_ref is None:
+            body_ref = L if L > 1e-3 else 1.0
+
+        Lmin = 0.6 * body_ref
+        Lmax = 1.6 * body_ref
+        mid  = 0.5 * (head + tail)
+
+        # 太短：强行沿 f 拉开
+        if L < Lmin and body_ref > 1e-3:
+            head = mid + f * (0.5 * Lmin)
+            tail = mid - f * (0.5 * Lmin)
+
+        # 太长：钳回环带
+        if L > Lmax:
+            head = mid + f * (0.5 * Lmax)
+            tail = mid - f * (0.5 * Lmax)
+
+        # 更新 xy
+        xy[i_head], xy[i_tail] = head, tail
+
+        # 防止“方向翻转”（上一帧 f · 当前 f < 0 就认为 head/tail 反了）
+        if prev_state is not None and prev_state.get("axes") is not None:
+            f_prev = prev_state["axes"]["f"]
+            f_now  = _unit(head - tail)
+            if np.dot(f_now, f_prev) < 0:
+                # 反了 → 把 head / tail 对调
+                xy[i_head], xy[i_tail] = xy[i_tail].copy(), xy[i_head].copy()
+                head, tail = xy[i_head], xy[i_tail]
+
+        # 更新 mid（供后面 chest 用）
+        mid = 0.5 * (head + tail)
+    else:
+        # 没有 head 或 tail 的情况，就用 chest 当中心；下面约束会弱一点
+        mid = xy[i_chest] if ok(i_chest) else None
+
+    # ========== 3) chest：要在 head/tail 中轴的“上方”，高度稳定 ==========
+    if ok(i_chest) and mid is not None:
+        chest = xy[i_chest]
+        rel   = chest - mid
+        # 分解到身体前向方向和法向方向
+        para = f * np.dot(rel, f)       # 沿身体轴
+        perp = rel - para               # 垂直于身体轴（就是“背包高度方向”）
+
+        h = float(np.linalg.norm(perp))
+        if h_ref is None:
+            h_ref = h if h > 1e-3 else max(5.0, 0.15 * body_ref)
+
+        # 限制 chest 离中轴的高度在 [0.5, 1.5]*h_ref
+        h_min, h_max = 0.5 * h_ref, 1.5 * h_ref
+        if h < 1e-3:
+            perp = right * h_ref
+        else:
+            perp = perp / h * np.clip(h, h_min, h_max)
+
+        chest_new = mid + para + perp
+        xy[i_chest] = chest_new
+        chest = chest_new
+    elif ok(i_chest):
+        chest = xy[i_chest]
+    else:
+        chest = None
+
+    # ========== 4) chest_left / chest_right：一左一右，各自参考长度 + 最小间距 ==========
+    if chest is not None and ok(i_l) and ok(i_r):
+        pL = xy[i_l]
+        pR = xy[i_r]
+
+        relL = pL - chest
+        relR = pR - chest
+
+        # 在 right 轴上的投影：正负号 = 左/右，绝对值 = 距离
+        dL = float(np.dot(relL, right))
+        dR = float(np.dot(relR, right))
+
+        wL_cur = abs(dL)
+        wR_cur = abs(dR)
+
+        if wL_ref is None:
+            wL_ref = wL_cur if wL_cur > 1e-3 else max(5.0, 0.2 * body_ref)
+        else:
+            wL_ref = 0.9 * wL_ref + 0.1 * wL_cur
+
+        if wR_ref is None:
+            wR_ref = wR_cur if wR_cur > 1e-3 else max(5.0, 0.2 * body_ref)
+        else:
+            wR_ref = 0.9 * wR_ref + 0.1 * wR_cur
+
+        # 左右自己一套范围（考虑透视畸变）
+        wL_min, wL_max = 0.5 * wL_ref, 1.6 * wL_ref
+        wR_min, wR_max = 0.5 * wR_ref, 1.6 * wR_ref
+
+        # 1) 确保一左一右：符号相反
+        if np.sign(dL) == np.sign(dR):
+            # 同侧 → 把更靠近的一侧翻到对面
+            if abs(dL) < abs(dR):
+                dL = -abs(dL)
+            else:
+                dR = -abs(dR)
+
+        # 2) 各自 clamp 到自己的参考区间
+        if dL < 0:
+            dL = -np.clip(abs(dL), wL_min, wL_max)
+        else:
+            dL =  np.clip(dL, wL_min, wL_max) * (-1.0)  # chest_left 理论上在左边
+
+        if dR > 0:
+            dR =  np.clip(abs(dR), wR_min, wR_max)
+        else:
+            dR = -np.clip(abs(dR), wR_min, wR_max) * (-1.0)  # chest_right 理论上在右边
+
+        # 3) 最小间距（防止两点几乎重合）
+        avg_w = 0.5 * (wL_ref + wR_ref)
+        min_gap = max(8.0, 0.15 * avg_w)
+        if (dR - dL) < min_gap:
+            mid_d = 0.5 * (dL + dR)
+            dL = mid_d - 0.5 * min_gap
+            dR = mid_d + 0.5 * min_gap
+
+        pL_new = chest + right * dL
+        pR_new = chest + right * dR
+        xy[i_l], xy[i_r] = pL_new, pR_new
+
+    # ========== 5) 返回新形态状态 ==========
+    new_state = {
+        "axes": axes,
+        "body_len_ref": body_ref,
+        "h_ref": h_ref,
+        "wL_ref": wL_ref,
+        "wR_ref": wR_ref,
+        "xy": xy.copy()
+    }
+    return xy, new_state
+
 # ========= 进程：摄像头 + 模型 推理 → 2D结果输出 =========
 def camera_worker(cam_index:int, MODEL_DIR:str, out_queue:mp.Queue, stop_event:mp.Event):
     # 参数
@@ -258,6 +472,9 @@ def camera_worker(cam_index:int, MODEL_DIR:str, out_queue:mp.Queue, stop_event:m
 
     hist = None  # 每点一个 deque 存 (t,x,y)
     REF_LEN = None  # 参考骨长 dict[(i,j)]=length
+
+    # >>> NEW: 形态状态（用于跨帧保持身体轴向和参考长度）
+    prev_shape_state = None
 
     # 1) 加载模型
     YAML_PATH = os.path.join(MODEL_DIR, "training_config.yaml")
@@ -447,6 +664,9 @@ def camera_worker(cam_index:int, MODEL_DIR:str, out_queue:mp.Queue, stop_event:m
             for i, (x, y) in enumerate(est_xy):
                 if not (np.isnan(x) or np.isnan(y)):
                     hist[i].append((t, float(x), float(y)))
+
+            # >>> NEW: 在可视化和输出之前，做一遍“几何兜底整形”
+            est_xy, prev_shape_state = sanitize_for_bug_backpack(est_xy, NODE_NAMES, prev_shape_state)
 
             # 6) 叠加可视化（骨架 + 点 + 名字）
             draw = frame_bgr.copy()
@@ -674,13 +894,13 @@ def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event,
 
 
                 pts3d[NODE_NAMES[i]] = [float(X[0])*0.05, float(X[1])*0.05, float(X[2])*0.05]
-                #print(NODE_NAMES[i],": ",float(X[0]), ",", float(X[1]), ",", float(X[2]))
+                # print(NODE_NAMES[i],": ",float(X[0]), ",", float(X[1]), ",", float(X[2]))
             print("------------------------------------------------------")
-            # pts3d["head"] = [0,0.5,0.2+ 0.1*(time.time() - start_time)]
-            # pts3d["chest_left"] = [-0.2,0,0.5]
-            # pts3d["chest"] = [0,0,0.5]
-            # pts3d["chest_right"] = [0.2,0,0.5]
-            # pts3d["tail"] = [0,-0.5,0.2]
+            pts3d["head"] = [0,0.5,0.2+ 0.1*(time.time() - start_time)]
+            pts3d["chest_left"] = [-0.2,0,0.5]
+            pts3d["chest"] = [0,0,0.5]
+            pts3d["chest_right"] = [0.2,0,0.5]
+            pts3d["tail"] = [0,-0.5,0.2]
             print(time.time(),": ",pts3d)
             packet = {
                 "timestamp": time.time() - start_time,
@@ -688,30 +908,30 @@ def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event,
                 "points": pts3d
             }
             sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
-            # pts3d["head"] = [9.7, 0.3, 0.2]
-            # pts3d["chest_left"] = [9.8, 0, 0.5]
-            # pts3d["chest"] = [10, 0, 0.5]
-            # pts3d["chest_right"] = [10.2, 0, 0.5]
-            # pts3d["tail"] = [10, -0.5, 0.2]
-            # print(time.time(),": ",pts3d)
-            # packet = {
-            #     "timestamp": time.time() - start_time,
-            #     "name": "Cockroach-v8",
-            #     "points": pts3d
-            # }
-            # sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
-            # pts3d["head"] = [5, 5.4, 0.7]
-            # pts3d["chest_left"] = [4.8, 5, 0.5]
-            # pts3d["chest"] = [5, 5, 0.5]
-            # pts3d["chest_right"] = [5.2, 5, 0.5]
-            # pts3d["tail"] = [5, 4.5, 0.2]
-            # print(time.time(),": ",pts3d)
-            # packet = {
-            #     "timestamp": time.time() - start_time,
-            #     "name": "Cockroach-12",
-            #     "points": pts3d
-            # }
-            # sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
+            pts3d["head"] = [10, 0.5, 0.2]
+            pts3d["chest_left"] = [9.8 + 0.1*(time.time() - start_time), 0, 0.5 + 0.1*(time.time() - start_time)]
+            pts3d["chest"] = [10, 0, 0.5]
+            pts3d["chest_right"] = [10.2 - 0.1*(time.time() - start_time), 0, 0.5 - 0.1*(time.time() - start_time)]
+            pts3d["tail"] = [10, -0.5, 0.2]
+            print(time.time(),": ",pts3d)
+            packet = {
+                "timestamp": time.time() - start_time,
+                "name": "Cockroach-v8",
+                "points": pts3d
+            }
+            sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
+            pts3d["head"] = [5 - 0.1*(time.time() - start_time), 5.5, 0.2]
+            pts3d["chest_left"] = [4.8, 5, 0.5]
+            pts3d["chest"] = [5, 5, 0.5]
+            pts3d["chest_right"] = [5.2, 5, 0.5]
+            pts3d["tail"] = [5, 4.5, 0.2]
+            print(time.time(),": ",pts3d)
+            packet = {
+                "timestamp": time.time() - start_time,
+                "name": "Cockroach-12",
+                "points": pts3d
+            }
+            sock.sendto(json.dumps(packet).encode('utf-8'), (UDP_IP, UDP_PORT))
             # 这里你可以：
             # - 打印
             # - 存入共享内存
