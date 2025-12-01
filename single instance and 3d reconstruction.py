@@ -360,30 +360,35 @@ def sanitize_for_bug_backpack(est_xy, NODE_NAMES, prev_state=None):
         # 没有 head 或 tail 的情况，就用 chest 当中心；下面约束会弱一点
         mid = xy[i_chest] if ok(i_chest) else None
 
-    # ========== 3) chest：要在 head/tail 中轴的“上方”，高度稳定 ==========
+    # ========== 3) chest：SLEAP 已经很准，基本不改它的位置 ==========
     if ok(i_chest) and mid is not None:
         chest = xy[i_chest]
-        rel   = chest - mid
-        # 分解到身体前向方向和法向方向
-        para = f * np.dot(rel, f)       # 沿身体轴
-        perp = rel - para               # 垂直于身体轴（就是“背包高度方向”）
+        rel = chest - mid
+        para = f * np.dot(rel, f)
+        perp = rel - para
 
         h = float(np.linalg.norm(perp))
+
+        # 只用当前的 h 来更新参考高度，但不去强行把 chest 拉到某个区间
         if h_ref is None:
-            h_ref = h if h > 1e-3 else max(5.0, 0.15 * body_ref)
-
-        # 限制 chest 离中轴的高度在 [0.5, 1.5]*h_ref
-        h_min, h_max = 0.5 * h_ref, 1.5 * h_ref
-        if h < 1e-3:
-            perp = right * h_ref
+            if h > 1e-3:
+                h_ref = h
+            else:
+                # 实在太小就给个基于身体长度的兜底参考
+                h_ref = max(5.0, 0.15 * body_ref)
         else:
-            perp = perp / h * np.clip(h, h_min, h_max)
+            # 平滑更新，但仍然完全尊重当前 chest 坐标
+            if h > 1e-3:
+                alpha = 0.9
+                h_ref = alpha * h_ref + (1 - alpha) * h
 
-        chest_new = mid + para + perp
-        xy[i_chest] = chest_new
-        chest = chest_new
-    elif ok(i_chest):
+        # 不改 xy[i_chest]，只更新 state 里的 h_ref
         chest = xy[i_chest]
+
+    elif ok(i_chest):
+        # 没有 head/tail 的时候，就更别动 chest 了
+        chest = xy[i_chest]
+
     else:
         chest = None
 
@@ -896,7 +901,7 @@ def fusion_worker(in_queue_a:mp.Queue, in_queue_b:mp.Queue, stop_event:mp.Event,
                 pts3d[NODE_NAMES[i]] = [float(X[0])*0.05, float(X[1])*0.05, float(X[2])*0.05]
                 # print(NODE_NAMES[i],": ",float(X[0]), ",", float(X[1]), ",", float(X[2]))
             print("------------------------------------------------------")
-            pts3d["head"] = [0,0.5,0.2+ 0.1*(time.time() - start_time)]
+            pts3d["head"] = [0,0.5,0.2]
             pts3d["chest_left"] = [-0.2,0,0.5]
             pts3d["chest"] = [0,0,0.5]
             pts3d["chest_right"] = [0.2,0,0.5]
